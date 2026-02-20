@@ -22,7 +22,7 @@ jobs:
 
       - name: Generate Threat Model
         id: threat-model
-        uses: cybrking/thr8@v1
+        uses: cybrking/thr8@v1.0.0.0
         with:
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
           output-formats: 'markdown,json,html'

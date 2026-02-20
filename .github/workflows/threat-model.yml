@@ -3,18 +3,17 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   threat-model:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Generate Threat Model
         uses: cybrking/thr8@v1.0.0.0
         with:
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
-
       - name: Upload Report
         uses: actions/upload-artifact@v4
         with:

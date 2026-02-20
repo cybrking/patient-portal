@@ -1,0 +1,76 @@
+version: '3.8'
+
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://healthbridge:password@postgres:5432/healthbridge
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - JWT_SECRET_KEY=dev-secret-change-in-production
+      - ENVIRONMENT=development
+      - AWS_REGION=us-east-1
+      - S3_RECORDS_BUCKET=healthbridge-records-dev
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./app:/app/app
+    networks:
+      - internal
+
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: healthbridge
+      POSTGRES_USER: healthbridge
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U healthbridge"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --requirepass devpassword
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal
+
+  # Local S3 mock
+  localstack:
+    image: localstack/localstack:3.0
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=s3,kms,secretsmanager
+      - DEFAULT_REGION=us-east-1
+    volumes:
+      - localstack_data:/tmp/localstack
+    networks:
+      - internal
+
+volumes:
+  postgres_data:
+  localstack_data:
+
+networks:
+  internal:
+    driver: bridge

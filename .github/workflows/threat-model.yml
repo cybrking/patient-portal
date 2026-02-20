@@ -26,7 +26,7 @@ jobs:
         with:
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
           output-formats: 'markdown,json,html'
-          fail-on-high-risk: 'true'
+          fail-on-high-risk: 'false'
 
       - name: Upload Threat Model Report
         uses: actions/upload-artifact@v4

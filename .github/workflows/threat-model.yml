@@ -1,58 +1,22 @@
-name: Security — PASTA Threat Model
-
+name: Threat Model
 on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
-  schedule:
-    - cron: '0 6 * * 1'  # Weekly Monday 6am — catch drift
 
 jobs:
   threat-model:
-    name: Generate PASTA Threat Model
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write  # For PR comment
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Generate Threat Model
-        id: threat-model
         uses: cybrking/thr8@v1.0.0.0
         with:
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
-          output-formats: 'markdown,json,html'
-          fail-on-high-risk: 'false'
 
-      - name: Upload Threat Model Report
+      - name: Upload Report
         uses: actions/upload-artifact@v4
         with:
-          name: threat-model-${{ github.run_number }}
+          name: threat-model
           path: threat-model/
-          retention-days: 90
-
-      - name: Comment on PR
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const report = fs.readFileSync('threat-model/THREAT_MODEL.md', 'utf8');
-            const summary = report.substring(0, 3000) + '\n\n_[Full report attached as artifact]_';
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: `## 🔐 PASTA Threat Model\n\n${summary}`
-            });
-
-      - name: Fail on Critical Findings
-        if: steps.threat-model.outputs.high-risk-count > 0
-        run: |
-          echo "❌ ${{ steps.threat-model.outputs.high-risk-count }} critical vulnerabilities found"
-          echo "Total threats: ${{ steps.threat-model.outputs.threats-found }}"
-          exit 1

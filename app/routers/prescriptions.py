@@ -80,17 +80,72 @@ async def create_prescription(
 
     return await create_standard_rx(rx, current_user)
 
+async def get_prescription_by_id(prescription_id: str) -> Optional[Prescription]:
+    """Fetch a prescription record from the database by ID."""
+    # Stub — real impl queries the database
+    # Returns None if not found
+    return None
+
+async def verify_epcs_two_factor(prescription_id: str, prescriber_id: str) -> bool:
+    """
+    Verify that DEA EPCS two-factor authentication has been completed
+    for the given controlled substance prescription.
+    Returns True only if the EPCS service confirms 2FA completion.
+    """
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                f"{EPCS_ENDPOINT}/verification-status",
+                params={
+                    "prescription_id": prescription_id,
+                    "prescriber_id": prescriber_id,
+                },
+                headers={"X-API-Key": PHARMACY_API_KEY},
+                timeout=10.0,
+            )
+            response.raise_for_status()
+            data = response.json()
+            return bool(data.get("two_factor_verified"))
+        except Exception:
+            # Fail closed: if EPCS check cannot be completed, deny transmission
+            return False
+
 @router.post("/{prescription_id}/send-to-pharmacy")
 async def send_to_pharmacy(
     prescription_id: str,
     transfer: PharmacyTransfer,
-    current_user: TokenData = Depends(require_role("doctor", "admin"))
+    current_user: TokenData = Depends(require_role("doctor"))
 ):
     """
     Electronically transmit prescription to pharmacy via SureScripts network.
-    Restricted to doctors and admins — patients must not be able to trigger
-    pharmacy transmission (DEA regulatory requirement, drug diversion prevention).
+    Restricted to doctors only — admin and patient roles must not be able to
+    trigger pharmacy transmission (DEA regulatory requirement, drug diversion
+    prevention).  The transmitting doctor must be the original prescriber, and
+    DEA EPCS two-factor authentication must be completed before any controlled
+    substance is transmitted.
     """
+    # Fetch the prescription to perform ownership and controlled-substance checks
+    prescription = await get_prescription_by_id(prescription_id)
+    if prescription is None:
+        raise HTTPException(status_code=404, detail="Prescription not found")
+
+    # Ownership check: only the original prescriber may transmit
+    if prescription.prescriber_id != current_user.user_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the original prescriber may transmit this prescription"
+        )
+
+    # DEA EPCS two-factor check for controlled substances
+    if prescription.is_controlled:
+        epcs_verified = await verify_epcs_two_factor(prescription_id, current_user.user_id)
+        if not epcs_verified:
+            raise HTTPException(
+                status_code=403,
+                detail="DEA EPCS two-factor authentication must be completed "
+                       "before transmitting a controlled substance prescription"
+            )
+
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"{PHARMACY_API_URL}/transmit",

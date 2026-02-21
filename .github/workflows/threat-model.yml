@@ -3,17 +3,25 @@ on:
   push:
     branches: [main]
   pull_request:
-  workflow_dispatch:
 
 jobs:
   threat-model:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
     steps:
       - uses: actions/checkout@v4
+
       - name: Generate Threat Model
-        uses: cybrking/thr8@v1.0.0.0
+        uses: cybrking/thr8@v1.1.0
         with:
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          create-issues: 'true'
+          auto-fix: 'true'
+
       - name: Upload Report
         uses: actions/upload-artifact@v4
         with:

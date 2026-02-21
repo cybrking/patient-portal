@@ -6,11 +6,60 @@ from datetime import datetime, timedelta
 import jwt
 import bcrypt
 import os
+import sys
 
 router = APIRouter()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
 
-SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+# Known weak / placeholder values that must never be used in any environment.
+_REJECTED_SECRET_VALUES = {
+    "dev-secret-change-in-production",
+    "secret",
+    "changeme",
+    "change-me",
+    "your-secret-key",
+    "jwt-secret",
+    "",
+}
+
+_MIN_SECRET_BYTES = 32
+
+
+def _load_and_validate_secret() -> str:
+    """Load JWT_SECRET_KEY from the environment and abort startup if it is
+    absent, too short, or matches a known-weak placeholder value."""
+    secret = os.getenv("JWT_SECRET_KEY", "")
+
+    if not secret:
+        print(
+            "FATAL: JWT_SECRET_KEY environment variable is not set. "
+            "Application startup aborted.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if secret.lower() in _REJECTED_SECRET_VALUES:
+        print(
+            "FATAL: JWT_SECRET_KEY matches a known weak/placeholder value. "
+            "Set a cryptographically random secret of at least "
+            f"{_MIN_SECRET_BYTES} bytes. Application startup aborted.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if len(secret.encode()) < _MIN_SECRET_BYTES:
+        print(
+            f"FATAL: JWT_SECRET_KEY is shorter than {_MIN_SECRET_BYTES} bytes. "
+            "Set a cryptographically random secret of at least "
+            f"{_MIN_SECRET_BYTES} bytes. Application startup aborted.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    return secret
+
+
+SECRET_KEY = _load_and_validate_secret()
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 REFRESH_TOKEN_EXPIRE_DAYS = 7

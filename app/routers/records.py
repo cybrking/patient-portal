@@ -45,6 +45,44 @@ class VisitNote(BaseModel):
     diagnosis_codes: List[str]  # ICD-10
     physician_id: str
 
+
+CLINICAL_ROLES = {"doctor", "nurse", "admin"}
+
+
+async def get_record_for_patient(record_id: str, patient_id: str) -> dict:
+    """
+    Fetch a medical record from the database and verify it belongs to patient_id.
+
+    Returns the record dict on success.
+    Raises HTTP 404 if the record does not exist.
+    Raises HTTP 403 if the record exists but belongs to a different patient.
+
+    TODO: Replace the stub below with a real database query, e.g.:
+        record = await db.fetchrow(
+            "SELECT id, patient_id, s3_key FROM medical_records WHERE id = $1",
+            record_id
+        )
+    """
+    # --- STUB: replace with real DB lookup ---
+    # Example real implementation:
+    #
+    #   record = await db.fetchrow(
+    #       "SELECT id, patient_id, s3_key FROM medical_records WHERE id = $1",
+    #       record_id,
+    #   )
+    #   if record is None:
+    #       raise HTTPException(status_code=404, detail="Record not found")
+    #   if record["patient_id"] != patient_id:
+    #       raise HTTPException(status_code=403, detail="Access denied")
+    #   return dict(record)
+    #
+    # Until the DB layer is wired up this function must be implemented before
+    # the download endpoint is reachable in production.
+    raise NotImplementedError(
+        "get_record_for_patient must be implemented with a real database query"
+    )
+
+
 @router.get("/{patient_id}/records", response_model=List[MedicalRecord])
 async def get_patient_records(
     patient_id: str,
@@ -108,10 +146,34 @@ async def get_record_download_url(
     record_id: str,
     current_user: TokenData = Depends(get_current_user)
 ):
-    """Generate presigned S3 URL for file download (expires in 15 min)."""
+    """Generate presigned S3 URL for file download (expires in 15 min).
+
+    Access rules:
+    - A patient may only download records belonging to their own patient account.
+    - Clinical staff (doctor, nurse, admin) may download records for any patient,
+      subject to existing role-based controls elsewhere in the stack.
+    - The record must be confirmed as belonging to patient_id in the database
+      before a presigned URL is issued; a mismatch returns HTTP 403.
+    """
+    # 1. Enforce that a patient can only request their own records.
+    if current_user.role == "patient" and current_user.user_id != patient_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: you may only download your own records"
+        )
+
+    # 2. Confirm the record belongs to patient_id in the database.
+    #    This prevents any authenticated user from accessing another patient's
+    #    PHI by manipulating patient_id or record_id in the URL (IDOR).
+    record = await get_record_for_patient(record_id=record_id, patient_id=patient_id)
+
+    # 3. Use the s3_key stored on the record rather than constructing it from
+    #    user-supplied path parameters, so the key is authoritative.
+    s3_key = record.get("s3_key") or f"patients/{patient_id}/records/{record_id}"
+
     url = s3.generate_presigned_url(
         "get_object",
-        Params={"Bucket": S3_BUCKET, "Key": f"patients/{patient_id}/records/{record_id}"},
+        Params={"Bucket": S3_BUCKET, "Key": s3_key},
         ExpiresIn=900
     )
     return {"download_url": url}

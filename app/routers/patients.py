@@ -44,6 +44,30 @@ def require_role(*roles):
         return current_user
     return role_checker
 
+
+async def check_physician_patient_assignment(physician_id: str, patient_id: str) -> bool:
+    """
+    Verify an active care relationship exists between the physician and patient.
+
+    Replace the stub body below with a real database query, e.g.:
+        result = await db.fetchval(
+            "SELECT 1 FROM care_team "
+            "WHERE patient_id = $1 AND physician_id = $2 AND is_active = TRUE "
+            "UNION "
+            "SELECT 1 FROM appointments "
+            "WHERE patient_id = $1 AND physician_id = $2 "
+            "  AND status IN ('scheduled','confirmed','completed') "
+            "LIMIT 1",
+            patient_id, physician_id
+        )
+        return result is not None
+    """
+    # TODO: replace with real DB query (see docstring above)
+    raise NotImplementedError(
+        "check_physician_patient_assignment must be implemented with a real DB query"
+    )
+
+
 @router.get("/me", response_model=PatientResponse)
 async def get_my_profile(current_user: TokenData = Depends(get_current_user)):
     """Patient views their own PHI."""
@@ -60,10 +84,36 @@ async def update_my_profile(
 @router.get("/{patient_id}", response_model=PatientResponse)
 async def get_patient(
     patient_id: str,
-    current_user: TokenData = Depends(require_role("doctor", "nurse", "admin"))
+    current_user: TokenData = Depends(require_role("doctor", "nurse", "admin",
+                                                   "psychiatrist", "addiction_specialist"))
 ):
-    """Clinical staff access to patient PHI. Generates audit log entry."""
-    # Enforce: doctors can only view patients assigned to them
+    """
+    Clinical staff access to patient PHI. Generates audit log entry.
+    Doctors, psychiatrists, and addiction_specialists may only access
+    patients assigned to them via an active appointment or care_team entry.
+    Nurses and admins have broader access (no assignment check required).
+    """
+    # Roles that must have an active patient assignment to proceed
+    assignment_checked_roles = {"doctor", "psychiatrist", "addiction_specialist"}
+
+    if current_user.role in assignment_checked_roles:
+        try:
+            assigned = await check_physician_patient_assignment(
+                current_user.user_id, patient_id
+            )
+        except NotImplementedError:
+            # Fail closed: deny access until the DB check is implemented
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: patient-physician assignment check not available"
+            )
+        if not assigned:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: no active care relationship with this patient"
+            )
+
+    # TODO: fetch and return patient record from DB
     pass
 
 @router.get("/", response_model=List[PatientResponse])

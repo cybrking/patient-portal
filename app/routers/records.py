@@ -6,6 +6,7 @@ from app.routers.auth import get_current_user, TokenData
 from app.routers.patients import require_role
 import boto3
 import os
+import uuid
 
 router = APIRouter()
 
@@ -78,12 +79,17 @@ async def upload_record_file(
     """
     Upload medical file (PDF, DICOM, image) to S3 with KMS encryption.
     File is scanned for malware in background task.
+    Original filename is stored as S3 object metadata; the S3 key is a
+    UUID4 to prevent path traversal via user-supplied filenames.
     """
     allowed_types = ["application/pdf", "image/jpeg", "image/png", "application/dicom"]
     if file.content_type not in allowed_types:
         raise HTTPException(status_code=400, detail="File type not allowed")
 
-    s3_key = f"patients/{patient_id}/records/{file.filename}"
+    # Use a UUID4 as the S3 key to prevent path traversal attacks.
+    # The original filename is preserved as object metadata only.
+    file_id = str(uuid.uuid4())
+    s3_key = f"patients/{patient_id}/records/{file_id}"
 
     # Upload with server-side encryption
     s3.upload_fileobj(
@@ -93,7 +99,10 @@ async def upload_record_file(
         ExtraArgs={
             "ServerSideEncryption": "aws:kms",
             "SSEKMSKeyId": S3_KMS_KEY,
-            "ContentType": file.content_type
+            "ContentType": file.content_type,
+            "Metadata": {
+                "original-filename": file.filename or ""
+            }
         }
     )
 

@@ -4,6 +4,9 @@ from starlette.responses import JSONResponse
 import redis
 import time
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 redis_client = redis.Redis(
     host=os.getenv("REDIS_HOST", "localhost"),
@@ -18,9 +21,8 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         # Stricter limits on auth endpoints to prevent brute force
-        limit = self.requests_per_minute
-        if request.url.path.startswith("/auth"):
-            limit = 10
+        is_auth_endpoint = request.url.path.startswith("/auth")
+        limit = 10 if is_auth_endpoint else self.requests_per_minute
 
         identifier = request.client.host
         key = f"rate_limit:{identifier}:{int(time.time() / 60)}"
@@ -36,7 +38,18 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                     headers={"Retry-After": "60"}
                 )
         except redis.RedisError:
-            # Fail open if Redis is down — log alert
-            pass
+            logger.error(
+                "Redis unavailable for rate limiting (key=%s)", key,
+                exc_info=True
+            )
+            # Auth endpoints fail CLOSED to preserve brute-force protection
+            # when Redis is unavailable.  All other endpoints fail open so
+            # normal traffic is not disrupted by a Redis outage.
+            if is_auth_endpoint:
+                return JSONResponse(
+                    status_code=503,
+                    content={"detail": "Service temporarily unavailable. Please try again later."},
+                    headers={"Retry-After": "30"}
+                )
 
         return await call_next(request)

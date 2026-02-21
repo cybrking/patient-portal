@@ -4,6 +4,9 @@ from starlette.responses import JSONResponse
 import redis
 import time
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 redis_client = redis.Redis(
     host=os.getenv("REDIS_HOST", "localhost"),
@@ -35,8 +38,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                     content={"detail": "Rate limit exceeded"},
                     headers={"Retry-After": "60"}
                 )
-        except redis.RedisError:
-            # Fail open if Redis is down — log alert
-            pass
+        except redis.RedisError as exc:
+            # Fail closed — do NOT allow requests through when Redis is unavailable.
+            # Passing through would eliminate brute-force protection and token
+            # blocklist enforcement, maximising the attack window during an outage.
+            logger.critical(
+                "Redis unavailable — rate limiter failing closed. "
+                "All requests blocked until Redis recovers. Error: %s",
+                exc,
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "detail": "Service temporarily unavailable. Please try again later."
+                },
+                headers={"Retry-After": "30"},
+            )
 
         return await call_next(request)

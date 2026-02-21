@@ -13,15 +13,16 @@ class AuditLogMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         start_time = time.time()
 
-        # Extract user from JWT if present
+        # Extract user from JWT if present — reuse the validated decode helper
+        # from auth so that the same issuer/audience/algorithm constraints apply.
         user_id = None
         user_role = None
         auth_header = request.headers.get("Authorization")
         if auth_header and auth_header.startswith("Bearer "):
             try:
-                import jwt, os
+                from app.routers.auth import _decode_token
                 token = auth_header.split(" ")[1]
-                payload = jwt.decode(token, os.getenv("JWT_SECRET_KEY"), algorithms=["HS256"])
+                payload = _decode_token(token)
                 user_id = payload.get("sub")
                 user_role = payload.get("role")
             except Exception:

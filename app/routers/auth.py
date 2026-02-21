@@ -37,6 +37,15 @@ class MFASetup(BaseModel):
     user_id: str
     totp_secret: str
 
+class RefreshRequest(BaseModel):
+    """Request body for the /auth/refresh endpoint.
+
+    Accepting the token exclusively as a JSON body field (never as a query
+    parameter or path segment) prevents the value from appearing in server
+    access logs, browser history, or Referer headers.
+    """
+    refresh_token: str
+
 def create_access_token(data: dict) -> str:
     to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -57,6 +66,10 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     )
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        # Reject tokens that are not of type "access" to prevent refresh
+        # tokens (or any other token type) from being used as bearer tokens.
+        if payload.get("type") != "access":
+            raise credentials_exception
         user_id: str = payload.get("sub")
         role: str = payload.get("role")
         if user_id is None:
@@ -83,20 +96,40 @@ async def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends
     )
 
 @router.post("/refresh", response_model=Token)
-async def refresh_token(refresh_token: str):
-    """Exchange a refresh token for a new access token."""
+async def refresh_token(body: RefreshRequest):
+    """Exchange a refresh token for a new access/refresh token pair.
+
+    The refresh token must be supplied as a JSON body field — never as a
+    query parameter — to avoid token leakage via server logs or browser
+    history.
+    """
+    invalid_exc = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid refresh token",
+    )
     try:
-        payload = jwt.decode(refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
-        if payload.get("type") != "refresh":
-            raise HTTPException(status_code=400, detail="Invalid token type")
-        token_data = {"sub": payload["sub"], "role": payload["role"]}
-        return Token(
-            access_token=create_access_token(token_data),
-            refresh_token=create_refresh_token(token_data),
-            token_type="bearer"
-        )
+        payload = jwt.decode(body.refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token expired")
     except jwt.JWTError:
-        raise HTTPException(status_code=401, detail="Invalid refresh token")
+        raise invalid_exc
+
+    # Strict token-type check: only tokens explicitly issued as "refresh" are
+    # accepted here; access tokens are rejected even if they decode correctly.
+    if payload.get("type") != "refresh":
+        raise invalid_exc
+
+    sub = payload.get("sub")
+    role = payload.get("role")
+    if not sub:
+        raise invalid_exc
+
+    token_data = {"sub": sub, "role": role}
+    return Token(
+        access_token=create_access_token(token_data),
+        refresh_token=create_refresh_token(token_data),
+        token_type="bearer"
+    )
 
 @router.post("/password-reset/request")
 async def request_password_reset(email: EmailStr):

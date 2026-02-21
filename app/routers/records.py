@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks, status
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
@@ -11,6 +11,12 @@ router = APIRouter()
 
 S3_BUCKET = os.getenv("S3_RECORDS_BUCKET")
 S3_KMS_KEY = os.getenv("S3_KMS_KEY_ARN")  # Server-side encryption key
+
+# Roles that represent clinical staff — may access any patient's records
+CLINICAL_ROLES = {"doctor", "nurse", "admin"}
+
+# Roles that may access sensitive (mental health / substance abuse) records
+SENSITIVE_RECORD_ROLES = {"doctor", "admin"}
 
 s3 = boto3.client(
     "s3",
@@ -45,6 +51,39 @@ class VisitNote(BaseModel):
     diagnosis_codes: List[str]  # ICD-10
     physician_id: str
 
+
+def _enforce_patient_access(patient_id: str, current_user: TokenData) -> None:
+    """
+    Raise 403 if the current user is not allowed to access records for
+    the given patient_id.
+
+    Rules:
+      - Clinical staff (doctor, nurse, admin) may access any patient.
+      - All other roles (e.g. 'patient') may only access their own records.
+    """
+    if current_user.role in CLINICAL_ROLES:
+        return  # clinical staff — allowed
+
+    # For patients (and any unknown role), enforce ownership
+    if current_user.user_id != patient_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: you may only view your own medical records"
+        )
+
+
+def _enforce_sensitive_access(current_user: TokenData) -> None:
+    """
+    Raise 403 if the current user does not have elevated access required
+    for sensitive records (mental health, substance abuse).
+    """
+    if current_user.role not in SENSITIVE_RECORD_ROLES:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: sensitive records require elevated clinical privileges"
+        )
+
+
 @router.get("/{patient_id}/records", response_model=List[MedicalRecord])
 async def get_patient_records(
     patient_id: str,
@@ -56,7 +95,18 @@ async def get_patient_records(
     Clinical staff can view assigned patients.
     Sensitive records (mental health) require elevated access.
     """
-    pass
+    # --- Ownership / role enforcement ---
+    _enforce_patient_access(patient_id, current_user)
+
+    # TODO: fetch records from the database filtered by patient_id (and
+    # optionally record_type).  The stub below represents that query result.
+    records: List[MedicalRecord] = []  # replace with real DB query
+
+    # Filter out sensitive records for users without elevated access
+    if current_user.role not in SENSITIVE_RECORD_ROLES:
+        records = [r for r in records if not r.is_sensitive]
+
+    return records
 
 @router.post("/{patient_id}/records", response_model=MedicalRecord)
 async def create_record(
@@ -109,6 +159,12 @@ async def get_record_download_url(
     current_user: TokenData = Depends(get_current_user)
 ):
     """Generate presigned S3 URL for file download (expires in 15 min)."""
+    # --- Ownership / role enforcement ---
+    _enforce_patient_access(patient_id, current_user)
+
+    # TODO: look up the record in the DB to check is_sensitive before
+    # generating the URL; enforce _enforce_sensitive_access if needed.
+
     url = s3.generate_presigned_url(
         "get_object",
         Params={"Bucket": S3_BUCKET, "Key": f"patients/{patient_id}/records/{record_id}"},
@@ -133,6 +189,8 @@ async def share_record(
     current_user: TokenData = Depends(get_current_user)
 ):
     """Patient authorizes sharing a specific record with another provider."""
+    # Patients may only share their own records
+    _enforce_patient_access(patient_id, current_user)
     pass
 
 async def scan_file_for_malware(s3_key: str):

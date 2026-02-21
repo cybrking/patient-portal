@@ -6,10 +6,11 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - DATABASE_URL=postgresql+asyncpg://healthbridge:password@postgres:5432/healthbridge
+      - DATABASE_URL=postgresql+asyncpg://healthbridge:${DB_PASSWORD}@postgres:5432/healthbridge
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - JWT_SECRET_KEY=dev-secret-change-in-production
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
       - ENVIRONMENT=development
       - AWS_REGION=us-east-1
       - S3_RECORDS_BUCKET=healthbridge-records-dev
@@ -28,7 +29,7 @@ services:
     environment:
       POSTGRES_DB: healthbridge
       POSTGRES_USER: healthbridge
-      POSTGRES_PASSWORD: password
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
     ports:
       - "5432:5432"
     volumes:
@@ -43,11 +44,11 @@ services:
 
   redis:
     image: redis:7-alpine
-    command: redis-server --requirepass devpassword
+    command: redis-server --requirepass ${REDIS_PASSWORD}
     ports:
       - "6379:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
       interval: 5s
       timeout: 5s
       retries: 5

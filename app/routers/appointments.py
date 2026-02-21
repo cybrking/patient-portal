@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, status
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, date
@@ -81,7 +81,53 @@ async def get_telehealth_session(
     Generate short-lived token for telehealth video room.
     Uses Daily.co or Twilio Video under the hood.
     Token expires when appointment window closes.
+    Requires the authenticated user to be the patient or assigned physician
+    for the appointment.
     """
+    # Fetch the appointment record and verify ownership before issuing a token.
+    appointment = await get_appointment_by_id(appointment_id)
+
+    if appointment is None:
+        # Return 403 rather than 404 to avoid leaking appointment existence
+        # to unauthorised callers.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied"
+        )
+
+    # Enforce object-level authorisation:
+    #   - patients must own the appointment
+    #   - doctors/nurses/admins must be the assigned physician or an admin
+    user_is_patient = current_user.role == "patient"
+    user_is_clinical = current_user.role in ("doctor", "nurse", "admin")
+
+    if user_is_patient:
+        if appointment["patient_id"] != current_user.user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied"
+            )
+    elif user_is_clinical:
+        # Doctors may only join their own appointments; admins have broader access.
+        if current_user.role == "doctor" and appointment["physician_id"] != current_user.user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied"
+            )
+    else:
+        # Unknown role — deny by default.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied"
+        )
+
+    # Confirm this is actually a telehealth appointment.
+    if appointment.get("appointment_type") != "telehealth":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Appointment is not a telehealth appointment"
+        )
+
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"{TELEHEALTH_SERVICE_URL}/rooms/{appointment_id}/tokens",
@@ -117,6 +163,28 @@ async def get_physician_availability(
 ):
     """Return open appointment slots for a physician."""
     pass
+
+async def get_appointment_by_id(appointment_id: str) -> Optional[dict]:
+    """
+    Retrieve the appointment record from the database by ID.
+
+    TODO: Replace this stub with a real database query, e.g.:
+
+        row = await db.fetchrow(
+            "SELECT id, patient_id, physician_id, appointment_type, status "
+            "FROM appointments WHERE id = $1",
+            appointment_id
+        )
+        return dict(row) if row else None
+
+    The returned dict must contain at minimum:
+        - "patient_id"       (str)
+        - "physician_id"     (str)
+        - "appointment_type" (str)
+    """
+    # Stub — returns None until wired to the database, which will cause the
+    # endpoint to return 403 for all requests (safe-fail).
+    return None
 
 async def create_telehealth_room(appt: AppointmentCreate) -> dict:
     async with httpx.AsyncClient() as client:

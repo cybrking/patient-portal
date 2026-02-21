@@ -6,6 +6,7 @@ from app.routers.auth import get_current_user, TokenData
 from app.routers.patients import require_role
 import boto3
 import os
+import uuid
 
 router = APIRouter()
 
@@ -83,7 +84,10 @@ async def upload_record_file(
     if file.content_type not in allowed_types:
         raise HTTPException(status_code=400, detail="File type not allowed")
 
-    s3_key = f"patients/{patient_id}/records/{file.filename}"
+    # Use a UUID as the stored filename to prevent path traversal via user-supplied filenames.
+    # The original filename is preserved as S3 object metadata for reference only.
+    stored_filename = str(uuid.uuid4())
+    s3_key = f"patients/{patient_id}/records/{stored_filename}"
 
     # Upload with server-side encryption
     s3.upload_fileobj(
@@ -93,7 +97,10 @@ async def upload_record_file(
         ExtraArgs={
             "ServerSideEncryption": "aws:kms",
             "SSEKMSKeyId": S3_KMS_KEY,
-            "ContentType": file.content_type
+            "ContentType": file.content_type,
+            "Metadata": {
+                "original-filename": file.filename or ""
+            }
         }
     )
 

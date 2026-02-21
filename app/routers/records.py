@@ -6,6 +6,8 @@ from app.routers.auth import get_current_user, TokenData
 from app.routers.patients import require_role
 import boto3
 import os
+import re
+import uuid
 
 router = APIRouter()
 
@@ -45,6 +47,26 @@ class VisitNote(BaseModel):
     diagnosis_codes: List[str]  # ICD-10
     physician_id: str
 
+
+def sanitize_filename(filename: str) -> str:
+    """
+    Strip any directory components and remove characters that are not
+    alphanumeric, dots, underscores, or hyphens to prevent path traversal
+    and other filename-based attacks.  A UUID prefix ensures uniqueness
+    even if two uploads share the same sanitized name.
+    """
+    # Take only the final path component (defeats '../../' traversal)
+    basename = os.path.basename(filename)
+    # Keep only safe characters
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", basename)
+    # Collapse leading dots to prevent hidden-file tricks (e.g. '..pdf')
+    safe_name = safe_name.lstrip(".")
+    if not safe_name:
+        safe_name = "upload"
+    # Prepend a UUID so the key is always unique and unpredictable
+    return f"{uuid.uuid4().hex}_{safe_name}"
+
+
 @router.get("/{patient_id}/records", response_model=List[MedicalRecord])
 async def get_patient_records(
     patient_id: str,
@@ -83,7 +105,10 @@ async def upload_record_file(
     if file.content_type not in allowed_types:
         raise HTTPException(status_code=400, detail="File type not allowed")
 
-    s3_key = f"patients/{patient_id}/records/{file.filename}"
+    # Sanitize the filename before constructing the S3 key to prevent
+    # path traversal attacks (e.g. '../../other_patient/records/file.pdf').
+    safe_filename = sanitize_filename(file.filename or "upload")
+    s3_key = f"patients/{patient_id}/records/{safe_filename}"
 
     # Upload with server-side encryption
     s3.upload_fileobj(

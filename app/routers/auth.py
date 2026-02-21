@@ -6,6 +6,9 @@ from datetime import datetime, timedelta
 import jwt
 import bcrypt
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
@@ -70,9 +73,9 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
 @router.post("/token", response_model=Token)
 async def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
     """Authenticate user and return JWT tokens. Supports MFA via TOTP."""
-    # db lookup, mfa validation, audit log would go here
     user = await authenticate_user(form_data.username, form_data.password)
     if not user:
+        # Use a generic message to prevent username enumeration
         raise HTTPException(status_code=400, detail="Incorrect email or password")
 
     token_data = {"sub": str(user["id"]), "role": user["role"]}
@@ -119,6 +122,79 @@ async def logout(token: str = Depends(oauth2_scheme)):
     """Invalidate token — adds to server-side blocklist."""
     pass
 
-async def authenticate_user(email: str, password: str):
-    # Stub — real impl queries PostgreSQL
-    return {"id": "user-123", "role": "patient"}
+async def _get_db_connection():
+    """
+    Return an asyncpg connection from the application connection pool.
+
+    The pool is expected to be stored on the FastAPI app state as
+    ``app.state.db_pool`` and initialised at startup via asyncpg.create_pool().
+    Importing here avoids a circular import; callers must ensure the pool has
+    been created before this function is invoked.
+    """
+    try:
+        from app.main import app  # noqa: PLC0415
+        return await app.state.db_pool.acquire()
+    except Exception as exc:  # pragma: no cover
+        logger.error("Failed to acquire DB connection: %s", exc)
+        raise
+
+async def authenticate_user(email: str, password: str) -> Optional[dict]:
+    """
+    Look up the user by e-mail address and verify the supplied password
+    against the bcrypt hash stored in the database.
+
+    Returns a dict with at least ``id`` and ``role`` keys on success,
+    or ``None`` if the credentials are invalid or the account is inactive.
+
+    The users table is expected to have the following relevant columns:
+        id            – UUID / text primary key
+        email         – unique, case-insensitive
+        password_hash – bcrypt hash (e.g. produced by bcrypt.hashpw)
+        role          – one of patient | doctor | nurse | admin
+        is_active     – boolean; inactive accounts are rejected
+    """
+    if not email or not password:
+        return None
+
+    conn = None
+    try:
+        conn = await _get_db_connection()
+        row = await conn.fetchrow(
+            """
+            SELECT id, email, password_hash, role, is_active
+            FROM users
+            WHERE email = $1
+            LIMIT 1
+            """,
+            email.lower().strip(),
+        )
+    except Exception as exc:  # pragma: no cover
+        logger.error("Database error during authentication: %s", exc)
+        return None
+    finally:
+        if conn is not None:
+            try:
+                from app.main import app  # noqa: PLC0415
+                await app.state.db_pool.release(conn)
+            except Exception:  # pragma: no cover
+                pass
+
+    if row is None:
+        # User not found — perform a dummy bcrypt check to prevent
+        # timing-based username enumeration.
+        _DUMMY_HASH = b"$2b$12$aaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        bcrypt.checkpw(password.encode("utf-8"), _DUMMY_HASH)
+        return None
+
+    if not row["is_active"]:
+        return None
+
+    stored_hash = row["password_hash"]
+    if isinstance(stored_hash, str):
+        stored_hash = stored_hash.encode("utf-8")
+
+    password_valid = bcrypt.checkpw(password.encode("utf-8"), stored_hash)
+    if not password_valid:
+        return None
+
+    return {"id": str(row["id"]), "role": row["role"]}

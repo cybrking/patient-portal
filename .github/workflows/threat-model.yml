@@ -24,6 +24,7 @@ jobs:
           create-issues: 'true'
           auto-fix: 'true'
           pr-severity: 'critical,high'
+          output-formats: 'markdown,json,html'
 
 
       - name: Remediation Summary

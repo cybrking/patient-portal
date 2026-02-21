@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks, status
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
@@ -11,6 +11,9 @@ router = APIRouter()
 
 S3_BUCKET = os.getenv("S3_RECORDS_BUCKET")
 S3_KMS_KEY = os.getenv("S3_KMS_KEY_ARN")  # Server-side encryption key
+
+# Roles permitted to access sensitive (42 CFR Part 2) records
+SENSITIVE_RECORD_ROLES = {"psychiatrist", "addiction_specialist"}
 
 s3 = boto3.client(
     "s3",
@@ -45,6 +48,33 @@ class VisitNote(BaseModel):
     diagnosis_codes: List[str]  # ICD-10
     physician_id: str
 
+
+async def _check_patient_physician_assignment(patient_id: str, physician_id: str) -> bool:
+    """
+    Verify that the requesting physician has an active care relationship with
+    the patient by checking the appointments / care_team table.
+
+    Returns True when an active assignment exists, False otherwise.
+
+    NOTE: Replace the stub below with a real database query, e.g.:
+        result = await db.fetchval(
+            "SELECT 1 FROM care_team "
+            "WHERE patient_id = $1 AND physician_id = $2 AND is_active = TRUE "
+            "UNION "
+            "SELECT 1 FROM appointments "
+            "WHERE patient_id = $1 AND physician_id = $2 "
+            "  AND status IN ('scheduled','confirmed','completed') "
+            "LIMIT 1",
+            patient_id, physician_id
+        )
+        return result is not None
+    """
+    # TODO: replace with real DB query (see docstring above)
+    raise NotImplementedError(
+        "_check_patient_physician_assignment must be implemented with a real DB query"
+    )
+
+
 @router.get("/{patient_id}/records", response_model=List[MedicalRecord])
 async def get_patient_records(
     patient_id: str,
@@ -54,9 +84,67 @@ async def get_patient_records(
     """
     Patients can view their own records.
     Clinical staff can view assigned patients.
-    Sensitive records (mental health) require elevated access.
+    Sensitive records (42 CFR Part 2 — mental health / substance abuse)
+    additionally require the psychiatrist or addiction_specialist role.
     """
-    pass
+    # --- 1. Identity-based access ---
+    is_own_record = (
+        current_user.role == "patient"
+        and current_user.user_id == patient_id
+    )
+
+    is_clinical_staff = current_user.role in {"doctor", "nurse", "admin",
+                                               "psychiatrist", "addiction_specialist"}
+
+    if not is_own_record and not is_clinical_staff:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: insufficient role"
+        )
+
+    # --- 2. Physician-patient assignment check for doctor/specialist roles ---
+    if current_user.role in {"doctor", "psychiatrist", "addiction_specialist"}:
+        try:
+            assigned = await _check_patient_physician_assignment(
+                patient_id, current_user.user_id
+            )
+        except NotImplementedError:
+            # Fail closed: deny access until the DB check is implemented
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: patient-physician assignment check not available"
+            )
+        if not assigned:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: no active care relationship with this patient"
+            )
+
+    # --- 3. Fetch records (stub — replace with real DB query) ---
+    # records = await db.fetch(
+    #     "SELECT * FROM medical_records WHERE patient_id = $1"
+    #     + (" AND record_type = $2" if record_type else ""),
+    #     *([patient_id, record_type] if record_type else [patient_id])
+    # )
+    records: List[MedicalRecord] = []  # TODO: replace with real DB fetch
+
+    # --- 4. Filter sensitive records: 42 CFR Part 2 elevated-role check ---
+    accessible_records = []
+    for rec in records:
+        if rec.is_sensitive:
+            # Patients may always view their own sensitive records
+            if is_own_record:
+                accessible_records.append(rec)
+            elif current_user.role in SENSITIVE_RECORD_ROLES:
+                accessible_records.append(rec)
+            else:
+                # Do not raise — silently omit to avoid confirming record existence
+                continue
+        else:
+            accessible_records.append(rec)
+
+    return accessible_records
+
 
 @router.post("/{patient_id}/records", response_model=MedicalRecord)
 async def create_record(
@@ -65,6 +153,13 @@ async def create_record(
     current_user: TokenData = Depends(require_role("doctor", "nurse"))
 ):
     """Create a new medical record entry."""
+    # Sensitive records may only be created by elevated roles
+    if record.is_sensitive and current_user.role not in SENSITIVE_RECORD_ROLES:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Creating sensitive (42 CFR Part 2) records requires "
+                   "psychiatrist or addiction_specialist role"
+        )
     pass
 
 @router.post("/{patient_id}/records/upload")

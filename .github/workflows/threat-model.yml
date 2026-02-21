@@ -23,6 +23,8 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           create-issues: 'true'
           auto-fix: 'true'
+          pr-severity: 'critical,high'
+
 
       - name: Remediation Summary
         run: |

@@ -6,11 +6,52 @@ from datetime import datetime, timedelta
 import jwt
 import bcrypt
 import os
+import sys
 
 router = APIRouter()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
 
-SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+# Known weak/dev/test secrets that must never be used in any environment
+_KNOWN_WEAK_SECRETS = {
+    "dev-secret-change-in-production",
+    "secret",
+    "changeme",
+    "test-secret",
+    "jwt-secret",
+    "supersecret",
+    "your-secret-key",
+    "insecure",
+}
+
+_JWT_SECRET_MIN_BYTES = 32
+
+
+def _validate_jwt_secret(secret: Optional[str]) -> str:
+    """Validate JWT_SECRET_KEY at startup; abort the process if invalid."""
+    errors = []
+
+    if not secret:
+        errors.append("JWT_SECRET_KEY environment variable is not set.")
+    else:
+        if secret.lower() in _KNOWN_WEAK_SECRETS or secret in _KNOWN_WEAK_SECRETS:
+            errors.append(
+                "JWT_SECRET_KEY matches a known weak/dev value and must not be used."
+            )
+        if len(secret.encode("utf-8")) < _JWT_SECRET_MIN_BYTES:
+            errors.append(
+                f"JWT_SECRET_KEY must be at least {_JWT_SECRET_MIN_BYTES} bytes "
+                f"(got {len(secret.encode('utf-8'))})."
+            )
+
+    if errors:
+        for msg in errors:
+            print(f"[FATAL] JWT secret validation failed: {msg}", file=sys.stderr)
+        sys.exit(1)
+
+    return secret
+
+
+SECRET_KEY: str = _validate_jwt_secret(os.getenv("JWT_SECRET_KEY"))
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 REFRESH_TOKEN_EXPIRE_DAYS = 7

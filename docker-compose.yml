@@ -9,7 +9,10 @@ services:
       - DATABASE_URL=postgresql+asyncpg://healthbridge:password@postgres:5432/healthbridge
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - JWT_SECRET_KEY=dev-secret-change-in-production
+      # JWT_SECRET_KEY must be supplied via a .env file or external secret manager.
+      # Do NOT set a hardcoded value here. Generate with:
+      #   python -c "import secrets; print(secrets.token_hex(32))"
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
       - ENVIRONMENT=development
       - AWS_REGION=us-east-1
       - S3_RECORDS_BUCKET=healthbridge-records-dev

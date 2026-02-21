@@ -6,6 +6,8 @@ from datetime import datetime, timedelta
 import jwt
 import bcrypt
 import os
+import hashlib
+import redis
 
 router = APIRouter()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
@@ -14,6 +16,41 @@ SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 REFRESH_TOKEN_EXPIRE_DAYS = 7
+
+# Redis client for token blocklist
+_redis_client: Optional[redis.Redis] = None
+
+def get_redis() -> redis.Redis:
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = redis.Redis(
+            host=os.getenv("REDIS_HOST", "localhost"),
+            port=int(os.getenv("REDIS_PORT", 6379)),
+            password=os.getenv("REDIS_AUTH_TOKEN"),
+            ssl=os.getenv("REDIS_SSL", "true").lower() == "true",
+            decode_responses=True,
+        )
+    return _redis_client
+
+BLOCKLIST_PREFIX = "token:blocklist:"
+
+def _blocklist_key(token: str) -> str:
+    """Return the Redis key for a given raw token string."""
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    return f"{BLOCKLIST_PREFIX}{token_hash}"
+
+def _is_token_blocklisted(token: str) -> bool:
+    try:
+        return get_redis().exists(_blocklist_key(token)) == 1
+    except redis.RedisError:
+        # Fail closed: if Redis is unreachable, treat all tokens as blocklisted
+        return True
+
+def _add_token_to_blocklist(token: str, exp: int) -> None:
+    """Write the token hash to Redis with TTL equal to remaining token lifetime."""
+    now = int(datetime.utcnow().timestamp())
+    ttl = max(exp - now, 1)  # always set at least 1 second
+    get_redis().setex(_blocklist_key(token), ttl, "1")
 
 class Token(BaseModel):
     access_token: str
@@ -61,6 +98,13 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         role: str = payload.get("role")
         if user_id is None:
             raise credentials_exception
+        # Reject tokens that have been explicitly logged out
+        if _is_token_blocklisted(token):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token has been revoked",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         return TokenData(user_id=user_id, role=role)
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
@@ -89,6 +133,9 @@ async def refresh_token(refresh_token: str):
         payload = jwt.decode(refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
         if payload.get("type") != "refresh":
             raise HTTPException(status_code=400, detail="Invalid token type")
+        # Reject refresh tokens that have been explicitly revoked
+        if _is_token_blocklisted(refresh_token):
+            raise HTTPException(status_code=401, detail="Refresh token has been revoked")
         token_data = {"sub": payload["sub"], "role": payload["role"]}
         return Token(
             access_token=create_access_token(token_data),
@@ -116,8 +163,19 @@ async def setup_mfa(current_user: TokenData = Depends(get_current_user)):
 
 @router.post("/logout")
 async def logout(token: str = Depends(oauth2_scheme)):
-    """Invalidate token — adds to server-side blocklist."""
-    pass
+    """Invalidate token — adds to server-side Redis blocklist."""
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        exp: Optional[int] = payload.get("exp")
+        if exp is None:
+            raise HTTPException(status_code=400, detail="Token missing expiry")
+        _add_token_to_blocklist(token, exp)
+    except jwt.ExpiredSignatureError:
+        # Already expired — nothing meaningful to blocklist, treat as success
+        pass
+    except jwt.JWTError:
+        raise HTTPException(status_code=400, detail="Invalid token")
+    return {"message": "Successfully logged out"}
 
 async def authenticate_user(email: str, password: str):
     # Stub — real impl queries PostgreSQL

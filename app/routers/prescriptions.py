@@ -4,6 +4,8 @@ from typing import Optional, List
 from datetime import date, datetime
 from app.routers.auth import get_current_user, TokenData
 from app.routers.patients import require_role
+import hashlib
+import hmac
 import httpx
 import os
 
@@ -15,6 +17,26 @@ PHARMACY_API_KEY = os.getenv("PHARMACY_API_KEY")
 
 # DEA EPCS (Electronic Prescribing for Controlled Substances) endpoint
 EPCS_ENDPOINT = os.getenv("EPCS_ENDPOINT")
+
+# Secret used to derive an anonymous interaction-check token from patient_id.
+# Must be set in the environment; never logged or transmitted externally.
+_INTERACTION_TOKEN_SECRET = os.getenv("INTERACTION_TOKEN_SECRET", "")
+
+
+def _anonymous_interaction_token(patient_id: str) -> str:
+    """Return an HMAC-SHA256 pseudonym for patient_id.
+
+    The token is a keyed hash — it is deterministic (the same patient always
+    gets the same token within this installation) but cannot be reversed to
+    recover patient_id without the secret key.  It contains no PHI and is
+    safe to send to third-party APIs.
+    """
+    return hmac.new(
+        _INTERACTION_TOKEN_SECRET.encode(),
+        patient_id.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
 
 class Prescription(BaseModel):
     id: str
@@ -69,7 +91,7 @@ async def create_prescription(
     Controlled substances routed through DEA EPCS with two-factor auth.
     Triggers drug interaction check via external API.
     """
-    # Check drug interactions
+    # Check drug interactions — patient_id is NOT forwarded to the third party.
     interactions = await check_drug_interactions(rx.patient_id, rx.ndc_code)
     if interactions.get("severe"):
         raise HTTPException(status_code=400, detail=f"Severe drug interaction: {interactions['detail']}")
@@ -119,11 +141,16 @@ async def cancel_prescription(
     pass
 
 async def check_drug_interactions(patient_id: str, ndc_code: str) -> dict:
-    """Check new drug against patient's current medication list via DrugBank API."""
+    """Check new drug against patient's current medication list via DrugBank API.
+
+    patient_id is converted to an anonymous HMAC pseudonym before being sent
+    to DrugBank so that no PHI leaves this system.
+    """
+    interaction_token = _anonymous_interaction_token(patient_id)
     async with httpx.AsyncClient() as client:
         response = await client.get(
-            f"https://api.drugbank.com/v1/interactions",
-            params={"patient_id": patient_id, "ndc": ndc_code},
+            "https://api.drugbank.com/v1/interactions",
+            params={"interaction_token": interaction_token, "ndc": ndc_code},
             headers={"Authorization": f"Bearer {os.getenv('DRUGBANK_API_KEY')}"}
         )
         return response.json()

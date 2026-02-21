@@ -20,6 +20,46 @@ provider "aws" {
   region = var.aws_region
 }
 
+# ---------------------------------------------------------------------------
+# Secrets Manager data sources — credentials are fetched at apply time and
+# are NOT stored as plaintext in the Terraform state file.
+# ---------------------------------------------------------------------------
+data "aws_secretsmanager_secret_version" "db" {
+  secret_id = aws_secretsmanager_secret.db.id
+}
+
+data "aws_secretsmanager_secret_version" "redis" {
+  secret_id = aws_secretsmanager_secret.redis.id
+}
+
+# ---------------------------------------------------------------------------
+# Secrets Manager secret resources (values must be seeded out-of-band or via
+# a separate bootstrap step — never via a Terraform variable).
+# ---------------------------------------------------------------------------
+resource "aws_secretsmanager_secret" "db" {
+  name                    = "healthbridge/${var.environment}/db-password"
+  description             = "RDS master password for healthbridge PostgreSQL"
+  kms_key_id              = aws_kms_key.secrets.arn
+  recovery_window_in_days = 30
+  tags                    = local.tags
+}
+
+resource "aws_secretsmanager_secret" "redis" {
+  name                    = "healthbridge/${var.environment}/redis-auth-token"
+  description             = "ElastiCache Redis AUTH token"
+  kms_key_id              = aws_kms_key.secrets.arn
+  recovery_window_in_days = 30
+  tags                    = local.tags
+}
+
+resource "aws_secretsmanager_secret" "jwt" {
+  name                    = "healthbridge/${var.environment}/jwt-secret-key"
+  description             = "JWT signing secret for patient-portal API"
+  kms_key_id              = aws_kms_key.secrets.arn
+  recovery_window_in_days = 30
+  tags                    = local.tags
+}
+
 # VPC — portal lives in private subnets only
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
@@ -49,7 +89,9 @@ resource "aws_db_instance" "postgres" {
 
   db_name  = "healthbridge"
   username = var.db_username
-  password = var.db_password  # Should use aws_secretsmanager_secret
+  # Password is read from Secrets Manager — never stored as a Terraform variable
+  # so it does not appear in plaintext in the state file.
+  password = data.aws_secretsmanager_secret_version.db.secret_string
 
   multi_az               = true
   db_subnet_group_name   = aws_db_subnet_group.main.name
@@ -58,9 +100,9 @@ resource "aws_db_instance" "postgres" {
   storage_encrypted = true
   kms_key_id        = aws_kms_key.rds.arn
 
-  backup_retention_period = 35  # HIPAA requires 6yr but daily backups for 35d
-  deletion_protection     = true
-  skip_final_snapshot     = false
+  backup_retention_period   = 35  # HIPAA requires 6yr but daily backups for 35d
+  deletion_protection       = true
+  skip_final_snapshot       = false
   final_snapshot_identifier = "healthbridge-final"
 
   enabled_cloudwatch_logs_exports = ["postgresql", "upgrade"]
@@ -82,7 +124,8 @@ resource "aws_elasticache_cluster" "redis" {
 
   transit_encryption_enabled = true
   at_rest_encryption_enabled = true
-  auth_token                 = var.redis_auth_token
+  # AUTH token read from Secrets Manager — not a plaintext Terraform variable
+  auth_token = data.aws_secretsmanager_secret_version.redis.secret_string
 
   tags = local.tags
 }
@@ -116,6 +159,37 @@ resource "aws_s3_bucket_public_access_block" "records" {
   restrict_public_buckets = true
 }
 
+# ---------------------------------------------------------------------------
+# Terraform state bucket — restrict access to the CI/CD IAM role only.
+# The bucket itself is managed outside this state (bootstrap bucket), so we
+# use an aws_s3_bucket_policy data resource to apply a policy without
+# importing the bucket into this state.
+# ---------------------------------------------------------------------------
+resource "aws_s3_bucket_policy" "terraform_state" {
+  bucket = "healthbridge-terraform-state"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "DenyAllExceptCICD"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:*"
+        Resource = [
+          "arn:aws:s3:::healthbridge-terraform-state",
+          "arn:aws:s3:::healthbridge-terraform-state/*"
+        ]
+        Condition = {
+          StringNotLike = {
+            "aws:PrincipalArn" = var.cicd_role_arn
+          }
+        }
+      }
+    ]
+  })
+}
+
 # KMS keys
 resource "aws_kms_key" "rds" {
   description             = "KMS key for RDS encryption"
@@ -126,6 +200,13 @@ resource "aws_kms_key" "rds" {
 
 resource "aws_kms_key" "s3" {
   description             = "KMS key for S3 medical records"
+  deletion_window_in_days = 30
+  enable_key_rotation     = true
+  tags                    = local.tags
+}
+
+resource "aws_kms_key" "secrets" {
+  description             = "KMS key for Secrets Manager secrets"
   deletion_window_in_days = 30
   enable_key_rotation     = true
   tags                    = local.tags

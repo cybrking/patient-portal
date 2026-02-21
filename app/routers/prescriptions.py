@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import date, datetime
@@ -50,6 +50,27 @@ class PharmacyTransfer(BaseModel):
     pharmacy_id: str
     pharmacy_ncpdp: str    # National Council for Prescription Drug Programs ID
 
+async def get_prescription_from_db(prescription_id: str) -> dict:
+    """
+    Fetch prescription record from the database.
+    Returns a dict with at least 'prescriber_id' and 'is_controlled'.
+    Stub — real implementation queries PostgreSQL.
+    """
+    # TODO: replace with actual DB query
+    raise NotImplementedError("get_prescription_from_db must be implemented")
+
+def require_mfa_for_controlled(current_user: TokenData) -> TokenData:
+    """
+    Dependency that enforces MFA completion (mfa_verified claim in JWT)
+    before allowing transmission of controlled substances.
+    """
+    if not getattr(current_user, "mfa_verified", False):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="DEA EPCS requires MFA verification. Please complete two-factor authentication."
+        )
+    return current_user
+
 @router.get("/patient/{patient_id}", response_model=List[Prescription])
 async def get_patient_prescriptions(
     patient_id: str,
@@ -84,13 +105,38 @@ async def create_prescription(
 async def send_to_pharmacy(
     prescription_id: str,
     transfer: PharmacyTransfer,
-    current_user: TokenData = Depends(require_role("doctor", "admin"))
+    current_user: TokenData = Depends(require_role("doctor"))
 ):
     """
     Electronically transmit prescription to pharmacy via SureScripts network.
-    Restricted to doctors and admins — patients must not be able to trigger
+    Restricted to doctors only — patients and admins must not be able to trigger
     pharmacy transmission (DEA regulatory requirement, drug diversion prevention).
+
+    Additional controls enforced:
+    - Transmitting doctor must be the original prescriber.
+    - Controlled substances require MFA (DEA EPCS two-factor) verified in the
+      current session (mfa_verified JWT claim).
     """
+    # Fetch the prescription to verify ownership and controlled status
+    try:
+        prescription = await get_prescription_from_db(prescription_id)
+    except NotImplementedError:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="Prescription lookup not yet implemented"
+        )
+
+    # Ownership check: only the original prescriber may transmit
+    if prescription["prescriber_id"] != current_user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the original prescriber may transmit this prescription to a pharmacy."
+        )
+
+    # DEA EPCS two-factor enforcement for controlled substances
+    if prescription.get("is_controlled"):
+        require_mfa_for_controlled(current_user)
+
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"{PHARMACY_API_URL}/transmit",

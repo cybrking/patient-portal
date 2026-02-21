@@ -84,10 +84,12 @@ async def create_prescription(
 async def send_to_pharmacy(
     prescription_id: str,
     transfer: PharmacyTransfer,
-    current_user: TokenData = Depends(get_current_user)
+    current_user: TokenData = Depends(require_role("doctor", "admin"))
 ):
     """
     Electronically transmit prescription to pharmacy via SureScripts network.
+    Restricted to doctors and admins — patients must not be able to trigger
+    pharmacy transmission (DEA regulatory requirement, drug diversion prevention).
     """
     async with httpx.AsyncClient() as client:
         response = await client.post(

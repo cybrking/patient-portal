@@ -5,6 +5,7 @@ from datetime import datetime
 from app.routers.auth import get_current_user, TokenData
 from app.routers.patients import require_role
 import boto3
+from botocore.exceptions import ClientError
 import os
 
 router = APIRouter()
@@ -16,6 +17,9 @@ s3 = boto3.client(
     "s3",
     region_name=os.getenv("AWS_REGION", "us-east-1")
 )
+
+# Clinical roles that may access records for patients they are assigned to
+CLINICAL_ROLES = {"doctor", "nurse", "admin"}
 
 class MedicalRecord(BaseModel):
     id: str
@@ -45,6 +49,76 @@ class VisitNote(BaseModel):
     diagnosis_codes: List[str]  # ICD-10
     physician_id: str
 
+
+def _assert_patient_access(current_user: TokenData, patient_id: str) -> None:
+    """
+    Enforce object-level authorization for PHI access.
+
+    - Patients may only access their own records (user_id must match patient_id).
+    - Clinical staff (doctor, nurse, admin) are permitted; doctor-patient
+      assignment validation should be added here once the patient service
+      exposes that relationship.
+
+    Raises HTTP 403 if the caller is not authorised to access the given
+    patient_id.
+    """
+    if current_user.role == "patient":
+        if current_user.user_id != patient_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied: you may only access your own records"
+            )
+    elif current_user.role not in CLINICAL_ROLES:
+        # Unknown / unprivileged role
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: insufficient role"
+        )
+    # TODO: for role == "doctor", additionally verify doctor-patient assignment
+    # against the patient service before returning PHI.
+
+
+def _assert_record_owned_by_patient(patient_id: str, record_id: str) -> None:
+    """
+    Verify that the S3 object identified by record_id actually lives under the
+    patient_id prefix.  This prevents an authenticated user from supplying a
+    valid record_id that belongs to a different patient.
+
+    The canonical key layout is:  patients/{patient_id}/records/{record_id}
+
+    We perform a head_object call so we never generate a presigned URL for a
+    key that does not exist or that sits outside the expected prefix.
+
+    Raises HTTP 404 if the object is absent, HTTP 403 if the key is not
+    scoped to the given patient.
+    """
+    # Reject any record_id that tries to escape the patient prefix via path
+    # traversal (e.g. "../../other-patient/records/secret").
+    if ".." in record_id or record_id.startswith("/"):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid record identifier"
+        )
+
+    expected_key = f"patients/{patient_id}/records/{record_id}"
+
+    try:
+        s3.head_object(Bucket=S3_BUCKET, Key=expected_key)
+    except ClientError as exc:
+        error_code = exc.response["Error"]["Code"]
+        if error_code in ("404", "NoSuchKey"):
+            raise HTTPException(
+                status_code=404,
+                detail="Record not found"
+            )
+        # For any other S3 error surface a generic 403 to avoid leaking
+        # bucket structure information.
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied"
+        )
+
+
 @router.get("/{patient_id}/records", response_model=List[MedicalRecord])
 async def get_patient_records(
     patient_id: str,
@@ -56,6 +130,7 @@ async def get_patient_records(
     Clinical staff can view assigned patients.
     Sensitive records (mental health) require elevated access.
     """
+    _assert_patient_access(current_user, patient_id)
     pass
 
 @router.post("/{patient_id}/records", response_model=MedicalRecord)
@@ -109,9 +184,17 @@ async def get_record_download_url(
     current_user: TokenData = Depends(get_current_user)
 ):
     """Generate presigned S3 URL for file download (expires in 15 min)."""
+    # 1. Verify the caller is authorised to access this patient's records.
+    _assert_patient_access(current_user, patient_id)
+
+    # 2. Verify the record actually belongs to this patient in S3 before
+    #    generating a presigned URL (object-level / IDOR check).
+    _assert_record_owned_by_patient(patient_id, record_id)
+
+    expected_key = f"patients/{patient_id}/records/{record_id}"
     url = s3.generate_presigned_url(
         "get_object",
-        Params={"Bucket": S3_BUCKET, "Key": f"patients/{patient_id}/records/{record_id}"},
+        Params={"Bucket": S3_BUCKET, "Key": expected_key},
         ExpiresIn=900
     )
     return {"download_url": url}
@@ -133,6 +216,8 @@ async def share_record(
     current_user: TokenData = Depends(get_current_user)
 ):
     """Patient authorizes sharing a specific record with another provider."""
+    # Only the patient who owns the record may share it.
+    _assert_patient_access(current_user, patient_id)
     pass
 
 async def scan_file_for_malware(s3_key: str):

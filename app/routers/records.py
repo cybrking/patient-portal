@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks, status
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
@@ -16,6 +16,10 @@ s3 = boto3.client(
     "s3",
     region_name=os.getenv("AWS_REGION", "us-east-1")
 )
+
+# Roles that are permitted to access sensitive (mental health / substance abuse) records.
+# Admins with a compliance need and doctors are elevated; nurses and plain patients are not.
+SENSITIVE_RECORD_ROLES = {"doctor", "admin"}
 
 class MedicalRecord(BaseModel):
     id: str
@@ -45,6 +49,82 @@ class VisitNote(BaseModel):
     diagnosis_codes: List[str]  # ICD-10
     physician_id: str
 
+
+def _verify_patient_access(patient_id: str, current_user: TokenData) -> None:
+    """
+    Raise HTTP 403 if current_user is not authorised to access records for
+    patient_id.
+
+    Authorization rules
+    -------------------
+    * patient  — may only access their own records (user_id must equal patient_id).
+    * doctor   — must be assigned to the patient (verified via is_doctor_assigned_to_patient).
+    * nurse    — must be assigned to the patient (same helper).
+    * admin    — always permitted (administrative / compliance access).
+    * anything else — denied.
+    """
+    role = current_user.role
+
+    if role == "patient":
+        if current_user.user_id != patient_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Patients may only access their own records."
+            )
+
+    elif role in ("doctor", "nurse"):
+        if not is_clinical_staff_assigned_to_patient(current_user.user_id, patient_id):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: not assigned to this patient."
+            )
+
+    elif role == "admin":
+        # Admins have unrestricted read access for compliance purposes.
+        pass
+
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: insufficient role."
+        )
+
+
+def _verify_sensitive_record_access(current_user: TokenData) -> None:
+    """
+    Raise HTTP 403 if the caller does not hold an elevated role that permits
+    access to sensitive (mental health / substance abuse) records.
+    """
+    if current_user.role not in SENSITIVE_RECORD_ROLES:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Access denied: sensitive mental health and substance abuse records "
+                "require elevated access privileges."
+            )
+        )
+
+
+def is_clinical_staff_assigned_to_patient(staff_id: str, patient_id: str) -> bool:
+    """
+    Return True when the clinical staff member identified by staff_id has an
+    active assignment to the patient identified by patient_id.
+
+    NOTE: This is a stub.  Replace the body with a real database query, e.g.:
+
+        row = db.execute(
+            "SELECT 1 FROM patient_assignments "
+            "WHERE staff_id = $1 AND patient_id = $2 AND is_active = TRUE",
+            staff_id, patient_id
+        ).fetchone()
+        return row is not None
+    """
+    # TODO: implement real DB lookup for doctor-patient / nurse-patient assignments.
+    raise NotImplementedError(
+        "is_clinical_staff_assigned_to_patient must be implemented before use."
+    )
+
+
 @router.get("/{patient_id}/records", response_model=List[MedicalRecord])
 async def get_patient_records(
     patient_id: str,
@@ -54,9 +134,43 @@ async def get_patient_records(
     """
     Patients can view their own records.
     Clinical staff can view assigned patients.
-    Sensitive records (mental health) require elevated access.
+    Sensitive records (mental health / substance abuse) require elevated access.
     """
-    pass
+    # 1. Verify the caller is allowed to access this patient's records at all.
+    _verify_patient_access(patient_id, current_user)
+
+    # 2. Fetch the records from the data store (stub — replace with real DB query).
+    #    Apply the optional record_type filter at the query level.
+    records: List[MedicalRecord] = fetch_records_from_db(patient_id, record_type)
+
+    # 3. If any returned record is sensitive, verify the caller has elevated access.
+    #    We check once up-front rather than per-record to avoid partial data leakage.
+    has_sensitive = any(r.is_sensitive for r in records)
+    if has_sensitive:
+        _verify_sensitive_record_access(current_user)
+
+    return records
+
+
+def fetch_records_from_db(
+    patient_id: str,
+    record_type: Optional[str] = None
+) -> List[MedicalRecord]:
+    """
+    Retrieve medical records for patient_id from the database.
+
+    NOTE: This is a stub.  Replace with a real parameterised query, e.g.:
+
+        query = "SELECT * FROM medical_records WHERE patient_id = $1"
+        params = [patient_id]
+        if record_type:
+            query += " AND record_type = $2"
+            params.append(record_type)
+        return db.execute(query, *params).fetchall()
+    """
+    # TODO: implement real DB query.
+    return []
+
 
 @router.post("/{patient_id}/records", response_model=MedicalRecord)
 async def create_record(

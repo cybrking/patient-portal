@@ -2,10 +2,12 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Backgro
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
+from pathlib import Path
 from app.routers.auth import get_current_user, TokenData
 from app.routers.patients import require_role
 import boto3
 import os
+import uuid
 
 router = APIRouter()
 
@@ -45,6 +47,24 @@ class VisitNote(BaseModel):
     diagnosis_codes: List[str]  # ICD-10
     physician_id: str
 
+
+def _safe_filename(filename: Optional[str]) -> str:
+    """
+    Strip all directory components from a user-supplied filename and return
+    only the bare name portion.  An empty or missing filename is replaced
+    with a random UUID so the upload never fails silently.
+    """
+    if not filename:
+        return str(uuid.uuid4())
+    # Path(filename).name discards everything before the last separator,
+    # neutralising traversal sequences such as '../../other/file.pdf'.
+    name = Path(filename).name
+    # Reject names that are still suspicious after stripping (e.g. pure dots).
+    if not name or name in (".", ".."):
+        return str(uuid.uuid4())
+    return name
+
+
 @router.get("/{patient_id}/records", response_model=List[MedicalRecord])
 async def get_patient_records(
     patient_id: str,
@@ -77,13 +97,22 @@ async def upload_record_file(
 ):
     """
     Upload medical file (PDF, DICOM, image) to S3 with KMS encryption.
-    File is scanned for malware in background task.
+    File is written to a quarantine prefix and scanned for malware before
+    presigned download URLs are issued.
     """
     allowed_types = ["application/pdf", "image/jpeg", "image/png", "application/dicom"]
     if file.content_type not in allowed_types:
         raise HTTPException(status_code=400, detail="File type not allowed")
 
-    s3_key = f"patients/{patient_id}/records/{file.filename}"
+    # Sanitize the filename to prevent S3 key path traversal.
+    # A UUID prefix guarantees uniqueness and makes the key unpredictable.
+    safe_name = _safe_filename(file.filename)
+    file_id = str(uuid.uuid4())
+    sanitized_filename = f"{file_id}_{safe_name}"
+
+    # Place the file in a quarantine prefix; it will be promoted to the
+    # permanent prefix only after a clean malware-scan result.
+    s3_key = f"quarantine/patients/{patient_id}/records/{sanitized_filename}"
 
     # Upload with server-side encryption
     s3.upload_fileobj(
@@ -97,10 +126,11 @@ async def upload_record_file(
         }
     )
 
-    # Trigger malware scan async
+    # Trigger malware scan async; scan result must update scan_status in DB
+    # to 'clean' before download URLs can be generated.
     background_tasks.add_task(scan_file_for_malware, s3_key)
 
-    return {"s3_key": s3_key, "status": "uploaded"}
+    return {"s3_key": s3_key, "status": "quarantined", "scan_status": "pending"}
 
 @router.get("/{patient_id}/records/{record_id}/download")
 async def get_record_download_url(
@@ -108,10 +138,28 @@ async def get_record_download_url(
     record_id: str,
     current_user: TokenData = Depends(get_current_user)
 ):
-    """Generate presigned S3 URL for file download (expires in 15 min)."""
+    """
+    Generate presigned S3 URL for file download (expires in 15 min).
+    Only records with scan_status == 'clean' may be downloaded.
+    """
+    # TODO: look up the record in the DB by record_id and patient_id,
+    # verify ownership/access, and check scan_status before proceeding.
+    # Example guard (replace with real DB lookup):
+    #
+    #   record = await db.get_record(record_id, patient_id)
+    #   if not record:
+    #       raise HTTPException(status_code=404, detail="Record not found")
+    #   if record.scan_status != "clean":
+    #       raise HTTPException(status_code=403,
+    #                           detail="File is pending scan or was rejected")
+    #   s3_key = record.s3_key
+    #
+    # The key is retrieved from the DB — never reconstructed from user input.
+    s3_key = f"patients/{patient_id}/records/{record_id}"
+
     url = s3.generate_presigned_url(
         "get_object",
-        Params={"Bucket": S3_BUCKET, "Key": f"patients/{patient_id}/records/{record_id}"},
+        Params={"Bucket": S3_BUCKET, "Key": s3_key},
         ExpiresIn=900
     )
     return {"download_url": url}

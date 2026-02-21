@@ -17,7 +17,7 @@ jobs:
 
       - name: Generate Threat Model
         id: threat-model
-        uses: cybrking/thr8@v1.1.0
+        uses: cybrking/thr8@v1
         with:
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
           github-token: ${{ secrets.GITHUB_TOKEN }}

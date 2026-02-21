@@ -12,6 +12,20 @@ router = APIRouter()
 S3_BUCKET = os.getenv("S3_RECORDS_BUCKET")
 S3_KMS_KEY = os.getenv("S3_KMS_KEY_ARN")  # Server-side encryption key
 
+# Fail fast at startup: S3_KMS_KEY_ARN must be set to ensure HIPAA-required
+# encryption at rest. An unset key would silently store PHI without SSE-KMS.
+if not S3_KMS_KEY:
+    raise RuntimeError(
+        "S3_KMS_KEY_ARN environment variable is not set. "
+        "All medical record uploads require SSE-KMS encryption. "
+        "Set this variable to the ARN of your KMS key before starting the service."
+    )
+
+if not S3_BUCKET:
+    raise RuntimeError(
+        "S3_RECORDS_BUCKET environment variable is not set."
+    )
+
 s3 = boto3.client(
     "s3",
     region_name=os.getenv("AWS_REGION", "us-east-1")
@@ -82,6 +96,14 @@ async def upload_record_file(
     allowed_types = ["application/pdf", "image/jpeg", "image/png", "application/dicom"]
     if file.content_type not in allowed_types:
         raise HTTPException(status_code=400, detail="File type not allowed")
+
+    # Defense-in-depth: re-validate at call time in case the module-level
+    # guard is ever bypassed (e.g., during testing with mocked imports).
+    if not S3_KMS_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="Server misconfiguration: KMS encryption key unavailable. Upload rejected."
+        )
 
     s3_key = f"patients/{patient_id}/records/{file.filename}"
 

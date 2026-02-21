@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks, status
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
@@ -11,6 +11,8 @@ router = APIRouter()
 
 S3_BUCKET = os.getenv("S3_RECORDS_BUCKET")
 S3_KMS_KEY = os.getenv("S3_KMS_KEY_ARN")  # Server-side encryption key
+
+CLINICAL_ROLES = {"doctor", "nurse", "admin"}
 
 s3 = boto3.client(
     "s3",
@@ -108,7 +110,22 @@ async def get_record_download_url(
     record_id: str,
     current_user: TokenData = Depends(get_current_user)
 ):
-    """Generate presigned S3 URL for file download (expires in 15 min)."""
+    """Generate presigned S3 URL for file download (expires in 15 min).
+
+    Access rules:
+    - Patients may only download records belonging to their own patient_id.
+    - Clinical staff (doctor, nurse, admin) may download records for any patient.
+    """
+    # Authorization check: patients can only access their own records;
+    # clinical roles are permitted access to any patient's records.
+    if current_user.role not in CLINICAL_ROLES:
+        # Treat the authenticated user as a patient — enforce ownership.
+        if current_user.user_id != patient_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: you do not have permission to download this record."
+            )
+
     url = s3.generate_presigned_url(
         "get_object",
         Params={"Bucket": S3_BUCKET, "Key": f"patients/{patient_id}/records/{record_id}"},
